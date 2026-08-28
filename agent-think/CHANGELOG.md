@@ -1,5 +1,13 @@
 # @cloudflare/agent-think
 
+## 0.0.8
+
+### Patch Changes
+
+- Updated dependencies [[`8ffb3ad`](https://github.com/cloudflare/agents/commit/8ffb3ad14a0aed72b047b8968981f10b141c700b), [`b12dc0b`](https://github.com/cloudflare/agents/commit/b12dc0b9c1293e8ce8c417de1de43f4661067854)]:
+  - agents@0.23.0
+  - @cloudflare/think@0.18.0
+
 ## 0.0.7
 
 ### Patch Changes

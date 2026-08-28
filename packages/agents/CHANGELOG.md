@@ -1,5 +1,103 @@
 # @cloudflare/agents
 
+## 0.23.0
+
+### Minor Changes
+
+- [#2175](https://github.com/cloudflare/agents/pull/2175) [`8ffb3ad`](https://github.com/cloudflare/agents/commit/8ffb3ad14a0aed72b047b8968981f10b141c700b) Thanks [@mattzcarey](https://github.com/mattzcarey)! - Lifecycle owns a durable job queue, driven as an alarm event loop.
+
+  The thing in the queue is a job: a serialisable callback address — the
+  owning capability plus a function name — with a due time and a payload.
+  Capabilities and the host push jobs through the scoped `jobs` surface;
+  Lifecycle drives due jobs in timestamp order when the alarm fires, owns
+  dispatch retries and platform-failure deferral, arms a deadman pre-alarm
+  before driving so an isolate death mid-drive still wakes the object, and
+  derives the physical alarm purely from queue state (queue mutations re-arm
+  automatically; an exclusive job suppresses ordinary candidates).
+
+  ```ts
+  class Cleanup extends LifecycleCapability {
+    async scheduleSweep(time: number) {
+      await this.lifecycle.jobs.push({ id: "sweep", fn: "sweep", time });
+    }
+    onJob({ job }: LifecycleJobContext) {
+      // drive result: nothing = complete, { rescheduleAt } = suspend,
+      // "yield" = leave due and wake again immediately
+    }
+  }
+  ```
+
+  The pull-based alarm-contribution model is removed: capability
+  `getNextAlarm()`/`onAlarm()`, host `getNextAlarm()`,
+  `LifecycleServices.alarms` (`rearm`/`disabled`), and `AlarmContribution`
+  are gone. Host `onAlarm()` remains and runs once per alarm invocation
+  after due jobs are driven. Terminal application failures reach the
+  owner's `onJobError()`, whose drive result decides advancement.
+
+  The alarm memory-limit circuit breaker ([#1825](https://github.com/cloudflare/agents/issues/1825)) moves from `Agent.alarm()`
+  into the Lifecycle event loop, targeting the exact executing job; Agent
+  contributes domain policy through the new `onAlarmMemoryLimit()` host
+  hook, and Scheduler's `__DO_NOT_USE_WILL_BREAK__handleAlarmMemoryLimit`
+  escape hatch is gone. After recording a strike the breaker now finishes by
+  resetting the isolate with `ctx.abort(reason, { retryAlarm: false })`
+  (retry of the handled alarm suppressed; the backoff alarm owns the next
+  wake), and `Agent.destroy()` uses the same no-retry abort so a completed
+  teardown's alarm cannot be retried into a fresh constructor that recreates
+  the deleted schema.
+
+  Scheduler keeps its entire public API and loses its storage and due-row
+  loop: a schedule is one job whose `fn` is the callback name, and interval
+  schedules are single-flight jobs. Existing `cf_agents_schedules` rows are
+  migrated into the `cf_agents_jobs` queue on startup and the legacy table
+  is dropped. Agent's public scheduling and `keepAlive()` APIs are
+  unchanged; its keep-alive, fiber-recovery/facet housekeeping, and
+  deferred-destroy wakes are now host jobs, and Think's
+  workflow-notification wake replaces the removed `_getExtensionAlarm()`.
+
+- [#2169](https://github.com/cloudflare/agents/pull/2169) [`b12dc0b`](https://github.com/cloudflare/agents/commit/b12dc0b9c1293e8ce8c417de1de43f4661067854) Thanks [@mattzcarey](https://github.com/mattzcarey)! - Move WebSockets out of Lifecycle into the opt-in `WebSockets`
+  capability, with callables served from an `RpcTarget`.
+
+  Lifecycle no longer models WebSockets — many hosts never use sockets.
+  Hosts that want connections install the capability, which owns the
+  subsystem end to end:
+
+  ```ts
+  new WebSockets({
+    handlers: { onConnect, onMessage, onClose },
+    callables: new RoomCallables(),
+  });
+  ```
+
+  The capability claims WebSocket upgrades, accepts hibernating sockets,
+  dispatches handlers inside the host invocation boundary, reciprocates
+  close handshakes, closes owned connections on host destruction, and
+  answers `getConnections()`/`getConnection()`. Without it installed,
+  upgrades are declined.
+
+  `callables` exposes an `RpcTarget`'s prototype methods to remote
+  callers over a Cap'n Web session (`?__agents_rpc=capnweb`), with native
+  `ReadableStream` streaming. `Agent` adds no new surface for this: its
+  `@callable()`-decorated methods are its interface, served on every wire
+  — natively over the legacy JSON RPC protocol and, through the
+  decorator-derived target, over the Cap'n Web endpoint. There is no
+  separate browser client either: `useAgent().stub`/`call` reach the
+  same interface, and a plain host's endpoint is one
+  `newWebSocketRpcSession(new WebSocket(callablesRpcUrl(url)))` away.
+
+  `Agent` installs the capability itself, so its `onConnect`/`onMessage`/
+  `onClose`/`onError`/`getConnectionTags` overrides and connection APIs
+  behave exactly as before (same wire, same hibernation attachment
+  format). The Lifecycle host contract drops the WebSocket hooks and
+  Lifecycle's `getConnections`/`getConnection`/`broadcast` are removed.
+
+  Lifecycle keeps only generic platform pass-throughs —
+  `onWebSocketUpgrade` plus `onWebSocketMessage`/`Close`/`Error` for
+  capability-owned hibernation wakes — and `LifecycleServices` gains a
+  narrow `sockets` surface (accept/get) and a connection/request scope on
+  `runInHostContext`. The capability interaction contract (three
+  channels: hooks, services, composition-root apertures) is now
+  documented on `DurableObjectCapability`.
+
 ## 0.22.0
 
 ### Minor Changes
