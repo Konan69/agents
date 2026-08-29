@@ -124,6 +124,135 @@ describe("jsonSchemaToType", () => {
       "type EmptyInput = Record<string, unknown>"
     );
   });
+
+  it("keeps sibling properties when resolving a $ref", () => {
+    const result = jsonSchemaToType(
+      {
+        $ref: "#/$defs/Input",
+        $defs: {
+          Input: {
+            type: "object",
+            properties: { query: { type: "string" } }
+          }
+        },
+        properties: {
+          label: { type: "string" },
+          doneLabel: { type: "string" }
+        },
+        required: ["label", "doneLabel"]
+      },
+      "RefinedInput"
+    );
+
+    expect(result).toBe(
+      [
+        "type RefinedInput = {",
+        "    query?: string;",
+        "} & {",
+        "    label: string;",
+        "    doneLabel: string;",
+        "}"
+      ].join("\n")
+    );
+  });
+
+  it("resolves a nested $ref inside object properties", () => {
+    const result = jsonSchemaToType(
+      {
+        type: "object",
+        $defs: {
+          Address: {
+            type: "object",
+            properties: { street: { type: "string" } },
+            required: ["street"]
+          }
+        },
+        properties: {
+          address: { $ref: "#/$defs/Address" }
+        },
+        required: ["address"]
+      },
+      "NestedRefInput"
+    );
+
+    expect(result).toBe(
+      [
+        "type NestedRefInput = {",
+        "    address: {",
+        "        street: string;",
+        "    };",
+        "}"
+      ].join("\n")
+    );
+  });
+
+  it("keeps typed siblings and drops constraint-only allOf members", () => {
+    const result = jsonSchemaToType(
+      {
+        type: "object",
+        properties: {
+          label: { type: "string", allOf: [{ minLength: 1 }] },
+          count: { type: "integer", allOf: [{ minimum: 0 }] }
+        },
+        required: ["label", "count"]
+      },
+      "RefinedInput"
+    );
+
+    expect(result).toBe(
+      [
+        "type RefinedInput = {",
+        "    label: string;",
+        "    count: number;",
+        "}"
+      ].join("\n")
+    );
+  });
+
+  it("keeps an item's base type when allOf only adds a refinement", () => {
+    expect(
+      jsonSchemaToType(
+        {
+          type: "array",
+          items: { type: "string", allOf: [{ minLength: 1 }] }
+        },
+        "RefinedList"
+      )
+    ).toBe("type RefinedList = string[]");
+  });
+
+  it("returns unknown when every allOf member is constraint-only", () => {
+    expect(
+      jsonSchemaToType(
+        { allOf: [{ minLength: 1 }, { minimum: 0 }] },
+        "Constraints"
+      )
+    ).toBe("type Constraints = unknown");
+  });
+
+  it("intersects anyOf with type-bearing siblings", () => {
+    expect(
+      jsonSchemaToType(
+        {
+          type: "string",
+          anyOf: [{ const: "short" }, { const: "long" }]
+        },
+        "StringChoice"
+      )
+    ).toBe('type StringChoice = string & ("short" | "long")');
+  });
+
+  it("intersects oneOf with type-bearing siblings", () => {
+    expect(
+      jsonSchemaToType(
+        {
+          type: "number",
+          oneOf: [{ const: 1 }, { const: 2 }]
+        },
+        "NumberChoice"
+      )
+    ).toBe("type NumberChoice = number & (1 | 2)");
+  });
 });
 
 // ---------------------------------------------------------------------------

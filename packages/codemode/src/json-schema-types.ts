@@ -59,6 +59,39 @@ function applyNullable(result: string, schema: unknown): string {
   return result;
 }
 
+const TYPE_BEARING_KEYWORDS = [
+  "type",
+  "properties",
+  "items",
+  "prefixItems",
+  "enum",
+  "const",
+  "additionalProperties",
+  "anyOf",
+  "oneOf",
+  "allOf",
+  "$ref"
+] as const;
+
+function getTypeBearingSiblings(
+  schema: JSONSchema7,
+  keyword: "$ref" | "anyOf" | "oneOf" | "allOf"
+): JSONSchema7 | null {
+  const siblings: Record<string, unknown> = { ...schema };
+  delete siblings[keyword];
+  delete siblings.$defs;
+  delete siblings.definitions;
+  delete siblings.$schema;
+  delete siblings.title;
+  delete siblings.description;
+  // Nullable applies to the complete combination, not only its sibling schema.
+  delete siblings.nullable;
+
+  return TYPE_BEARING_KEYWORDS.some((key) => key in siblings)
+    ? (siblings as JSONSchema7)
+    : null;
+}
+
 /**
  * Convert a JSON Schema to a TypeScript type string.
  * This is a direct conversion without going through Zod.
@@ -86,36 +119,53 @@ export function jsonSchemaToTypeString(
   };
 
   try {
-    // Handle $ref
+    // $ref siblings further constrain the resolved schema and must be preserved.
     if (schema.$ref) {
       const resolved = resolveRef(schema.$ref, ctx.root);
       if (!resolved) return "unknown";
-      return applyNullable(
-        jsonSchemaToTypeString(resolved, indent, nextCtx),
-        schema
-      );
+      const resolvedType = jsonSchemaToTypeString(resolved, indent, nextCtx);
+      const siblings = getTypeBearingSiblings(schema, "$ref");
+      if (!siblings) return applyNullable(resolvedType, schema);
+      const siblingType = jsonSchemaToTypeString(siblings, indent, nextCtx);
+      return applyNullable(`${resolvedType} & ${siblingType}`, schema);
     }
 
-    // Handle anyOf/oneOf (union types)
+    // anyOf siblings constrain the whole union, so preserve them as an intersection.
     if (schema.anyOf) {
       const types = schema.anyOf.map((s) =>
         jsonSchemaToTypeString(s, indent, nextCtx)
       );
-      return applyNullable(types.join(" | "), schema);
+      const unionType = types.join(" | ");
+      const siblings = getTypeBearingSiblings(schema, "anyOf");
+      if (!siblings) return applyNullable(unionType, schema);
+      const siblingType = jsonSchemaToTypeString(siblings, indent, nextCtx);
+      return applyNullable(`${siblingType} & (${unionType})`, schema);
     }
+
+    // oneOf siblings constrain the whole union, so preserve them as an intersection.
     if (schema.oneOf) {
       const types = schema.oneOf.map((s) =>
         jsonSchemaToTypeString(s, indent, nextCtx)
       );
-      return applyNullable(types.join(" | "), schema);
+      const unionType = types.join(" | ");
+      const siblings = getTypeBearingSiblings(schema, "oneOf");
+      if (!siblings) return applyNullable(unionType, schema);
+      const siblingType = jsonSchemaToTypeString(siblings, indent, nextCtx);
+      return applyNullable(`${siblingType} & (${unionType})`, schema);
     }
 
-    // Handle allOf (intersection types)
+    // allOf siblings establish the base type while constraint-only members add no TS type.
     if (schema.allOf) {
+      const siblings = getTypeBearingSiblings(schema, "allOf");
       const types = schema.allOf.map((s) =>
         jsonSchemaToTypeString(s, indent, nextCtx)
       );
-      return applyNullable(types.join(" & "), schema);
+      if (siblings) {
+        types.unshift(jsonSchemaToTypeString(siblings, indent, nextCtx));
+      }
+      const typeBearingParts = types.filter((type) => type !== "unknown");
+      if (typeBearingParts.length === 0) return "unknown";
+      return applyNullable(typeBearingParts.join(" & "), schema);
     }
 
     // Handle enum
@@ -154,10 +204,14 @@ export function jsonSchemaToTypeString(
     if (type === "boolean") return applyNullable("boolean", schema);
     if (type === "null") return "null";
 
-    if (type === "array") {
+    const prefixItems = (schema as Record<string, unknown>)
+      .prefixItems as JSONSchema7Definition[];
+    if (
+      type === "array" ||
+      schema.items !== undefined ||
+      Array.isArray(prefixItems)
+    ) {
       // Tuple support: prefixItems (JSON Schema 2020-12)
-      const prefixItems = (schema as Record<string, unknown>)
-        .prefixItems as JSONSchema7Definition[];
       if (Array.isArray(prefixItems)) {
         const types = prefixItems.map((s) =>
           jsonSchemaToTypeString(s, indent, nextCtx)
@@ -180,7 +234,11 @@ export function jsonSchemaToTypeString(
       return applyNullable("unknown[]", schema);
     }
 
-    if (type === "object" || schema.properties) {
+    if (
+      type === "object" ||
+      schema.properties ||
+      schema.additionalProperties !== undefined
+    ) {
       const props = schema.properties || {};
       const required = new Set(schema.required || []);
       const lines: string[] = [];
