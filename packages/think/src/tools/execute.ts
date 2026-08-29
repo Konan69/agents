@@ -213,6 +213,131 @@ function optionsFromAgent(agent: ExecuteToolAgent): CreateExecuteToolOptions {
   };
 }
 
+// A 16k-token budget at Codemode's cross-model estimate of four characters
+// per token keeps the inline execute result near 64k characters. Oversized
+// serialized results spill instead of silently losing their tail.
+const EXECUTE_RESULT_INLINE_MAX_TOKENS = 16_000;
+const EXECUTE_RESULT_INLINE_MAX_CHARS = EXECUTE_RESULT_INLINE_MAX_TOKENS * 4;
+// The preview uses half the result budget so the enclosing tool protocol,
+// execution id, hint, and future small metadata stay below the inline ceiling.
+const EXECUTE_RESULT_PREVIEW_MAX_CHARS = EXECUTE_RESULT_INLINE_MAX_CHARS / 2;
+// Workspace-backed Durable Object writes are kept below the 1 MB value limit.
+const EXECUTE_RESULT_WRITE_CHUNK_MAX_CHARS = 900_000;
+const EXECUTE_RESULT_SPILL_HINT =
+  "Read it with read/grep or state.readFile in slices";
+
+/** An oversized execute result replaced by a durable, model-retrievable file. */
+type SpilledExecuteResult = {
+  readonly spilled: true;
+  readonly path: string;
+  readonly bytes: number;
+  readonly preview: string;
+  readonly hint: typeof EXECUTE_RESULT_SPILL_HINT;
+};
+
+/** Preserve today's bounded behavior whenever durable spill is unavailable. */
+function truncateExecuteResult(result: unknown): unknown {
+  return truncateResult(result, {
+    maxTokens: EXECUTE_RESULT_INLINE_MAX_TOKENS
+  });
+}
+
+/** Return the exact JSON text persisted for a spill, when JSON supports it. */
+function serializeExecuteResult(result: unknown): string | undefined {
+  try {
+    return JSON.stringify(result);
+  } catch {
+    return undefined;
+  }
+}
+
+/** Render a stable lowercase SHA-256 digest for a content-addressed path. */
+async function executeResultDigest(bytes: Uint8Array): Promise<string> {
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
+  return Array.from(digest, (byte) => byte.toString(16).padStart(2, "0")).join(
+    ""
+  );
+}
+
+/** Avoid splitting a UTF-16 surrogate pair across two separately encoded writes. */
+function executeResultChunkEnd(serialized: string, offset: number): number {
+  const proposedEnd = Math.min(
+    offset + EXECUTE_RESULT_WRITE_CHUNK_MAX_CHARS,
+    serialized.length
+  );
+  if (proposedEnd === serialized.length) return proposedEnd;
+
+  const finalCodeUnit = serialized.charCodeAt(proposedEnd - 1);
+  const nextCodeUnit = serialized.charCodeAt(proposedEnd);
+  const endsWithHighSurrogate =
+    finalCodeUnit >= 0xd800 && finalCodeUnit <= 0xdbff;
+  const startsWithLowSurrogate =
+    nextCodeUnit >= 0xdc00 && nextCodeUnit <= 0xdfff;
+  return endsWithHighSurrogate && startsWithLowSurrogate
+    ? proposedEnd - 1
+    : proposedEnd;
+}
+
+/** Write the complete serialized result without crossing the per-write limit. */
+async function writeExecuteResultSpill(
+  state: StateBackend,
+  path: string,
+  serialized: string
+): Promise<void> {
+  let offset = 0;
+  let firstChunk = true;
+  while (offset < serialized.length) {
+    const end = executeResultChunkEnd(serialized, offset);
+    const chunk = serialized.slice(offset, end);
+    if (firstChunk) {
+      await state.writeFile(path, chunk);
+      firstChunk = false;
+    } else {
+      await state.appendFile(path, chunk);
+    }
+    offset = end;
+  }
+}
+
+/**
+ * Keep small results inline and replace oversized results with an honest
+ * `spilled: true` tagged shape whose path contains the full JSON value.
+ */
+async function spillExecuteResult(
+  state: StateBackend | undefined,
+  result: unknown
+): Promise<unknown> {
+  const serialized = serializeExecuteResult(result);
+  if (
+    serialized === undefined ||
+    serialized.length <= EXECUTE_RESULT_INLINE_MAX_CHARS
+  ) {
+    return result;
+  }
+  if (!state) return truncateExecuteResult(result);
+
+  try {
+    const encoded = new TextEncoder().encode(serialized);
+    const digest = await executeResultDigest(encoded);
+    const path = `/tool-output/execute-${digest}.json`;
+    await writeExecuteResultSpill(state, path, serialized);
+    const spilled: SpilledExecuteResult = {
+      spilled: true,
+      path,
+      bytes: encoded.byteLength,
+      preview: serialized.slice(0, EXECUTE_RESULT_PREVIEW_MAX_CHARS),
+      hint: EXECUTE_RESULT_SPILL_HINT
+    };
+    return spilled;
+  } catch (error) {
+    console.warn(
+      "think: failed to spill oversized execute result; truncating it instead.",
+      error
+    );
+    return truncateExecuteResult(result);
+  }
+}
+
 /**
  * Build the codemode runtime behind the execute tool, returning the runtime
  * handle and connectors alongside the tool. Use this instead of
@@ -290,7 +415,7 @@ export function createExecuteRuntime(
     executor,
     connectors,
     name: options.name ?? "execute",
-    transformResult: truncateResult
+    transformResult: (result) => spillExecuteResult(options.state, result)
   });
 
   if (agent) {
@@ -370,7 +495,9 @@ function connectorHints(
     hints.state =
       "the workspace filesystem. Every method takes ONE object argument: " +
       "`state.readFile({ path })`, `state.writeFile({ path, content })`, " +
-      "`state.readdir({ path })`, `state.glob({ pattern })`, …";
+      "`state.readdir({ path })`, `state.glob({ pattern })`, …. " +
+      "Each connector result must stay under the 1 MB durable-log limit; " +
+      "fetch larger data in chunks and append each chunk to state.*.";
   }
   if (options.browser) {
     hints.cdp =

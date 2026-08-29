@@ -33,6 +33,17 @@ type ExecuteModelProjection = {
   modelResultPayloadChars: number;
 };
 
+type ExecuteResultSpillProjection = {
+  spilled: boolean;
+  path: string;
+  bytes: number;
+  previewChars: number;
+  modelOutputSerializedChars: number;
+  modelOutputContainsPath: boolean;
+  workspaceSerializedChars: number;
+  workspacePayloadChars: number;
+};
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -152,6 +163,70 @@ export class ThinkExecuteToolAgent extends Think {
           ? projected.value.status
           : "missing",
       modelResultPayloadChars: modelResult.payloadChars
+    };
+  }
+
+  /**
+   * Return an oversized script result through the actual model projection and
+   * independently inspect the durable workspace file named by the spill tag.
+   */
+  async executeResultSpillProjection(): Promise<ExecuteResultSpillProjection> {
+    const executeTool = this.#runtime().tool;
+    if (!executeTool.execute || !executeTool.toModelOutput) {
+      throw new Error("execute tool is missing execution or model projection");
+    }
+    const input = {
+      code: `async () => "x".repeat(300000)`
+    };
+    type ModelOutputOptions = Parameters<
+      NonNullable<typeof executeTool.toModelOutput>
+    >[0];
+    const rawOutput = (await executeTool.execute(input, {
+      toolCallId: "result-spill-projection",
+      messages: [],
+      abortSignal: new AbortController().signal,
+      context: {}
+    })) as ModelOutputOptions["output"];
+    const projected = await executeTool.toModelOutput({
+      toolCallId: "result-spill-projection",
+      input,
+      output: rawOutput
+    });
+    if (projected.type !== "json" || !isRecord(projected.value)) {
+      throw new Error("execute model projection is not a JSON object");
+    }
+    const modelResult = projected.value.result;
+    if (
+      !isRecord(modelResult) ||
+      modelResult.spilled !== true ||
+      typeof modelResult.path !== "string" ||
+      typeof modelResult.bytes !== "number" ||
+      typeof modelResult.preview !== "string"
+    ) {
+      throw new Error("execute model projection is missing its spill tag");
+    }
+
+    const persisted = await this.workspace.readFile(modelResult.path);
+    if (persisted === null) {
+      throw new Error("execute result spill file was not persisted");
+    }
+    const payload = JSON.parse(persisted);
+    if (typeof payload !== "string") {
+      throw new Error(
+        "execute result spill file did not contain a JSON string"
+      );
+    }
+    const modelOutputSerialized = JSON.stringify(projected.value);
+
+    return {
+      spilled: modelResult.spilled,
+      path: modelResult.path,
+      bytes: modelResult.bytes,
+      previewChars: modelResult.preview.length,
+      modelOutputSerializedChars: modelOutputSerialized.length,
+      modelOutputContainsPath: modelOutputSerialized.includes(modelResult.path),
+      workspaceSerializedChars: persisted.length,
+      workspacePayloadChars: payload.length
     };
   }
 

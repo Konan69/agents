@@ -82,6 +82,22 @@ describe("execute tool on the codemode runtime", () => {
     });
   });
 
+  it("spills an oversized script result to the workspace before model projection", async () => {
+    const agent = await freshAgent();
+    const projection = await agent.executeResultSpillProjection();
+
+    expect(projection.spilled).toBe(true);
+    expect(projection.path).toMatch(
+      /^\/tool-output\/execute-[0-9a-f]{64}\.json$/
+    );
+    expect(projection.bytes).toBe(300_002);
+    expect(projection.previewChars).toBe(32_000);
+    expect(projection.modelOutputSerializedChars).toBeLessThan(64_000);
+    expect(projection.modelOutputContainsPath).toBe(true);
+    expect(projection.workspaceSerializedChars).toBe(300_002);
+    expect(projection.workspacePayloadChars).toBe(300_000);
+  });
+
   it("one-liner: createExecuteTool(agent) defaults state from the workspace and records on this.codemode", async () => {
     const agent = await freshAgent();
     const out = await agent.runOneLiner(
