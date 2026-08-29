@@ -1,11 +1,12 @@
-import type { Tool, ToolSet } from "ai";
+import type { JSONValue, Tool, ToolSet } from "ai";
 import {
   createCodemodeRuntime,
   DynamicWorkerExecutor,
   truncateResult,
   type CodemodeConnector,
   type CodemodeRuntimeHandle,
-  type Executor
+  type Executor,
+  type ProxyToolOutput
 } from "@cloudflare/codemode";
 import { ToolSetConnector } from "@cloudflare/codemode/ai";
 import type { StateBackend, WorkspaceFsLike } from "@cloudflare/shell";
@@ -301,9 +302,28 @@ export function createExecuteRuntime(
     connectorHints: connectorHints(options)
   });
   const baseExecute = baseTool.execute;
+  const modelTool: Tool = {
+    ...baseTool,
+    /**
+     * Codemode returns `calls` so persisted UI and audit views can inspect the
+     * durable replay log. That trace can contain every nested call's complete
+     * arguments and result, so it is metadata rather than model context. AI
+     * SDK replay keeps the raw output on the UI part and applies this projection
+     * only to the tool result sent to the model on this and later turns.
+     */
+    toModelOutput: ({ output }) => {
+      const { calls: _calls, ...modelOutput } = output as ProxyToolOutput;
+      return {
+        type: "json",
+        // Codemode tool outputs are JSON protocol values. Removing one field
+        // preserves that contract even though `result` is typed as `unknown`.
+        value: modelOutput as JSONValue
+      };
+    }
+  };
   const tool: Tool = baseExecute
     ? ({
-        ...baseTool,
+        ...modelTool,
         // Paused outputs land in the transcript (and the model context) as a
         // normal tool result; a gated call's raw args (e.g. a writeFile
         // payload) can be huge. Truncate them in the model-facing payload —
@@ -317,7 +337,7 @@ export function createExecuteRuntime(
             )
           )
       } as Tool)
-    : baseTool;
+    : modelTool;
 
   return {
     runtime,

@@ -69,6 +69,19 @@ describe("execute tool on the codemode runtime", () => {
     expect(out.executionId).toBeTruthy();
   });
 
+  it("keeps calls in the audit output but excludes them from model output", async () => {
+    const agent = await freshAgent();
+    const projection = await agent.executeModelProjection();
+
+    expect(projection).toEqual({
+      rawCallCount: 1,
+      rawCallResultChars: 120_000,
+      modelHasCalls: false,
+      modelStatus: "completed",
+      modelResultPayloadChars: 120_000
+    });
+  });
+
   it("one-liner: createExecuteTool(agent) defaults state from the workspace and records on this.codemode", async () => {
     const agent = await freshAgent();
     const out = await agent.runOneLiner(

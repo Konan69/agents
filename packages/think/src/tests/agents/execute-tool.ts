@@ -25,6 +25,18 @@ type ExecuteOutput = {
   pending?: Array<{ connector: string; method: string }>;
 };
 
+type ExecuteModelProjection = {
+  rawCallCount: number;
+  rawCallResultChars: number;
+  modelHasCalls: boolean;
+  modelStatus: string;
+  modelResultPayloadChars: number;
+};
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 async function invoke(
   executeTool: { execute?: unknown },
   code: string
@@ -49,6 +61,11 @@ export class ThinkExecuteToolAgent extends Think {
           inputSchema: z.object({ a: z.number(), b: z.number() }),
           execute: async ({ a, b }) => ({ sum: a + b })
         }),
+        largePayload: tool({
+          description: "Return a deterministic payload for audit-log tests",
+          inputSchema: z.object({ size: z.number().int().nonnegative() }),
+          execute: async ({ size }) => ({ payload: "x".repeat(size) })
+        }),
         launchMissiles: tool({
           description: "Approval-gated — must be stripped from the sandbox",
           inputSchema: z.object({}),
@@ -71,6 +88,71 @@ export class ThinkExecuteToolAgent extends Think {
   /** Run code through the `createExecuteTool(this)` one-liner. */
   async runOneLiner(code: string): Promise<ExecuteOutput> {
     return invoke(createExecuteTool(this), code);
+  }
+
+  /**
+   * Compare the complete runtime result with the model projection exposed by
+   * the same tool. The large nested result proves the replay log remains an
+   * audit surface even though it is absent from model context.
+   */
+  async executeModelProjection(): Promise<ExecuteModelProjection> {
+    const executeTool = this.#runtime().tool;
+    if (!executeTool.execute || !executeTool.toModelOutput) {
+      throw new Error("execute tool is missing execution or model projection");
+    }
+    const input = {
+      code: `async () => {
+        const result = await tools.largePayload({ size: 120000 });
+        return { payloadChars: result.payload.length };
+      }`
+    };
+    type ModelOutputOptions = Parameters<
+      NonNullable<typeof executeTool.toModelOutput>
+    >[0];
+    const rawOutput = (await executeTool.execute(input, {
+      toolCallId: "model-projection",
+      messages: [],
+      abortSignal: new AbortController().signal,
+      context: {}
+    })) as ModelOutputOptions["output"];
+    if (!isRecord(rawOutput) || !Array.isArray(rawOutput.calls)) {
+      throw new Error("raw execute output is missing its calls audit log");
+    }
+    const firstCall = rawOutput.calls[0];
+    if (!isRecord(firstCall) || !isRecord(firstCall.result)) {
+      throw new Error("raw execute output is missing the nested call result");
+    }
+    const rawPayload = firstCall.result.payload;
+    if (typeof rawPayload !== "string") {
+      throw new Error("nested call result is missing its payload");
+    }
+
+    const projected = await executeTool.toModelOutput({
+      toolCallId: "model-projection",
+      input,
+      output: rawOutput
+    });
+    if (projected.type !== "json" || !isRecord(projected.value)) {
+      throw new Error("execute model projection is not a JSON object");
+    }
+    const modelResult = projected.value.result;
+    if (
+      !isRecord(modelResult) ||
+      typeof modelResult.payloadChars !== "number"
+    ) {
+      throw new Error("execute model projection lost the script result");
+    }
+
+    return {
+      rawCallCount: rawOutput.calls.length,
+      rawCallResultChars: rawPayload.length,
+      modelHasCalls: "calls" in projected.value,
+      modelStatus:
+        typeof projected.value.status === "string"
+          ? projected.value.status
+          : "missing",
+      modelResultPayloadChars: modelResult.payloadChars
+    };
   }
 
   /** The sandbox type surface advertised by the `tools` connector. */
