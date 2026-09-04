@@ -1258,6 +1258,16 @@ export function useAgentChat<
     Map<string, unknown>
   >(new Map());
 
+  // Mirror of `clientToolResults` for the stale-entry cleanup effect below.
+  // That effect runs on every `chatMessages` change but must not depend on the
+  // map itself (doing so would re-run it on its own update). Reading the map
+  // through a ref lets it decide whether anything is actually stale *before*
+  // calling `setClientToolResults`, so a streaming turn that prunes nothing
+  // schedules no update at all. See the comment on the effect for why merely
+  // returning `prev` from the updater is not enough.
+  const clientToolResultsRef = useRef(clientToolResults);
+  clientToolResultsRef.current = clientToolResults;
+
   const initialMessagesRef = useRef(initialMessages);
   initialMessagesRef.current = initialMessages;
 
@@ -2564,8 +2574,22 @@ export function useAgentChat<
 
   // Cleanup stale entries from clientToolResults when messages change
   // to prevent memory leak in long conversations.
-  // Note: We intentionally exclude clientToolResults from deps to avoid infinite loops.
-  // The functional update form gives us access to the previous state.
+  // Note: We intentionally exclude clientToolResults from deps to avoid infinite loops;
+  // the ref mirror above gives us the current map without adding a dependency.
+  //
+  // The staleness check MUST happen before `setClientToolResults`, not inside the
+  // updater. Returning `prev` unchanged does not make the dispatch free: React only
+  // takes the eager-bailout path when the fiber has no pending work, so during a
+  // streamed turn (where the next chunk has already scheduled one) the update is
+  // queued and the component re-renders regardless. Worse, this effect is passive
+  // and a SyncLane commit flushes passive effects inside the commit itself, so each
+  // dispatch lands on DefaultLane while `root.pendingLanes` is still non-empty --
+  // exactly the condition under which React increments `nestedUpdateCount` instead
+  // of resetting it. The counter is a monotonic accumulator, not a loop detector, so
+  // one dispatch per streamed chunk reaches the limit of 50 on any long answer and
+  // React throws "Maximum update depth exceeded" (#185) from whatever update comes
+  // next. Measured on agents@0.21.0: 353 dispatches from this effect in a single
+  // answer, with the counter climbing monotonically to the throw.
   useEffect(() => {
     // Collect all current toolCallIds from messages
     const currentToolCallIds = new Set<string>();
@@ -2577,30 +2601,31 @@ export function useAgentChat<
       }
     }
 
-    // Use functional update to check and clean stale entries atomically
-    setClientToolResults((prev) => {
-      if (prev.size === 0) return prev;
-
-      // Check if any entries are stale
-      let hasStaleEntries = false;
-      for (const toolCallId of prev.keys()) {
-        if (!currentToolCallIds.has(toolCallId)) {
-          hasStaleEntries = true;
-          break;
-        }
+    // Decide against the current map whether there is anything to prune. The common
+    // case during streaming is "nothing stale", and taking it costs zero updates.
+    const current = clientToolResultsRef.current;
+    let hasStaleEntries = false;
+    for (const toolCallId of current.keys()) {
+      if (!currentToolCallIds.has(toolCallId)) {
+        hasStaleEntries = true;
+        break;
       }
+    }
 
-      // Only create new Map if there are stale entries to remove
-      if (!hasStaleEntries) return prev;
-
-      const newMap = new Map<string, unknown>();
-      for (const [id, output] of prev) {
-        if (currentToolCallIds.has(id)) {
-          newMap.set(id, output);
+    // Only dispatch when entries actually need removing. The updater still recomputes
+    // from `prev` rather than from the ref, so a concurrent write between this check
+    // and the update is not clobbered.
+    if (hasStaleEntries) {
+      setClientToolResults((prev) => {
+        const newMap = new Map<string, unknown>();
+        for (const [id, output] of prev) {
+          if (currentToolCallIds.has(id)) {
+            newMap.set(id, output);
+          }
         }
-      }
-      return newMap;
-    });
+        return newMap;
+      });
+    }
 
     // Also cleanup processedToolCalls to prevent issues in long conversations
     for (const toolCallId of processedToolCalls.current) {
